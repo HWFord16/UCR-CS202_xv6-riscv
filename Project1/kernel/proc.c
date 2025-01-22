@@ -6,6 +6,7 @@
 #include "proc.h"
 #include "defs.h"
 
+
 struct cpu cpus[NCPU];
 
 struct proc proc[NPROC];
@@ -691,5 +692,51 @@ procdump(void)
       state = "???";
     printf("%d %s %s", p->pid, state, p->name);
     printf("\n");
+  }
+}
+
+//lab1- system call info() implementation
+int
+info(int param)
+{
+  struct proc *p; //pointer to instance of struct proc
+  int proc_count=0;
+  
+  //switch cases to process the various user inputted parameters
+  switch(param){
+    case 1: { //count #processes in system
+      for(p=proc; p<&proc[NPROC]; p++){
+        acquire(&p->lock);  //lock needed; avoid race conditions iter. proc array
+          if(p->state != UNUSED) proc_count++; //count active proc only
+        release(&p->lock);  //relase lock
+      }
+      return proc_count;
+    }
+    case 2: {//return count of # of info() func calls by cur_proc
+      return myproc()->infoCalls;
+    }
+    case 3: {//#memory pages cur_proc using add. above 0xF000000
+      uint64 virtualAddy;
+      uint64 numPages=0;  //total memory pages
+      uint64 pagesAbove=0;//pages above 0xF000000
+      struct proc *curproc = myproc(); //get current process
+      //printf("Process sz: %lu\n", curproc->sz);
+
+      //check pagetable to find pages above the addy threshold
+      for(virtualAddy = 0; virtualAddy < curproc->sz; virtualAddy+=PGSIZE){
+        if(walkaddr(curproc->pagetable,virtualAddy)){ //check if page is mapped
+          numPages++;
+          //printf("Page mapped at VA: %ld\n", virtualAddy);
+          if(virtualAddy >= 0xF000000) pagesAbove++;
+        }
+      }
+      printf("Pages above 0xF000000: %lu\n", pagesAbove);
+      return numPages-1; 
+    }
+    case 4: {//address of kernel stack
+      return (uint64)myproc()->kstack;
+    }
+    default:
+      return -1; //invalid paramter
   }
 }

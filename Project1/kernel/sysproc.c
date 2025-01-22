@@ -91,3 +91,16 @@ sys_uptime(void)
   release(&tickslock);
   return xticks;
 }
+
+//lab1- system call for proccess info
+uint64 
+sys_info(void)  
+{
+  int param; //user inputted parameter to pass to kernel
+
+  //extract user parameter and pass to sys_call func. info in proc.c
+  argint(0,&param);
+  myproc()->infoCalls++; //increment var in struct proc to tack count
+
+  return info(param);
+}

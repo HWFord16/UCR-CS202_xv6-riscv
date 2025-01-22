@@ -22,6 +22,7 @@ int getpid(void);
 char* sbrk(int);
 int sleep(int);
 int uptime(void);
+int info(int);  //lab 1 sys_call function info()
 
 // ulib.c
 int stat(const char*, struct stat*);
