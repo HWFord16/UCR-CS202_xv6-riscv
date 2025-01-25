@@ -721,46 +721,27 @@ info(int param)
       struct proc *curproc = myproc(); //get current process
       pagetable_t pagetable = curproc->pagetable; 
       uint64 threshold = 0xF000000; //address threshold
-      uint64 ptSize = 512; // #pageTable entries
+      
+       printf("\n");
+      //iterate through current process page table w/ xv6 walk() for each level (L2->L0)
+      for (uint64 va = 0; va < MAXVA ; va += PGSIZE) { //range va 0 -> max VA xv6 allows
+        pte_t *pte = walk(pagetable, va, 0);
+        if (pte && (*pte & PTE_V)) {  //check page valid bit
+          numPages++;
 
-      printf("\n");
-      // Walk through L2 page table (512 entries max)
-      for (int l2_index = 0; l2_index < ptSize; l2_index++) {
-        pte_t *l2_entry = &pagetable[l2_index];
+          //get page table indices from virtual address and perform bit shift & masking
+          int l2_index = (va >> 30) & 0x1FF;  //L2 bits range (30-38)
+          int l1_index = (va >> 21) & 0x1FF;  //L1 bits range (21-29)
+          int l0_index = (va >> 12) & 0x1FF;  //L0 bits range (12-20)
+          printf("Page found at indices: L2=%d, L1=%d, L0=%d (VA: 0x%lx)\n",
+                l2_index, l1_index, l0_index, va);
 
-        if (*l2_entry & PTE_V) {  //check if L2 entry is valid
-          pagetable_t l1_table = (pagetable_t)PTE2PA(*l2_entry);
-
-          // Walk through L1 page table (512 entries max)
-          for (int l1_index = 0; l1_index < ptSize; l1_index++) {
-            pte_t *l1_entry = &l1_table[l1_index];
-
-            if (*l1_entry & PTE_V) {  // Check if L1 entry is valid
-              pagetable_t l0_table = (pagetable_t)PTE2PA(*l1_entry);
-
-              // Walk through L0 page table (512 entries max)
-              for (int l0_index = 0; l0_index < ptSize; l0_index++) {
-                if (l0_table[l0_index] & PTE_V) {  // Check if L0 entry is valid
-                  numPages++;
-
-                  // Construct the virtual address based on indices
-                  uint64 page_address = ((uint64)l2_index << 30) |
-                                        ((uint64)l1_index << 21) |
-                                        ((uint64)l0_index << 12);
-                  printf("Page found at indices: L2=%d, L1=%d, L0=%d (VA: 0x%lx)\n", l2_index, l1_index, l0_index, page_address);
-
-                  // Check if page address is above the threshold
-                  if (page_address > threshold) pagesAbove++;
-                }
-              }
-            }
-          }
+          //check page va is above address threshold
+          if (va > threshold) pagesAbove++;
         }
       }
-
-      printf("Total Pages: %lu, Pages Above 0xF000000: %lu\n", numPages, pagesAbove);
-      printf("\n");
-      return (numPages << 32) | pagesAbove;
+      printf("Total Pages: %lu, Pages Above 0xF000000: %lu\n\n", numPages, pagesAbove);
+      return pagesAbove;
     }
     case 4: {//address of kernel stack
       return myproc()->kstack;
