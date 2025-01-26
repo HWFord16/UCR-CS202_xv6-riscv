@@ -1,0 +1,193 @@
+diff --git a/Project1/Makefile b/Project1/Makefile
+index f8c820e..e52c608 100644
+--- a/Project1/Makefile
++++ b/Project1/Makefile
+@@ -139,6 +139,7 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_test_info\
+ 
+ fs.img: mkfs/mkfs README $(UPROGS)
+ 	mkfs/mkfs fs.img README $(UPROGS)
+
+
+diff --git a/Project1/kernel/defs.h b/Project1/kernel/defs.h
+index d1b6bb9..3a78be8 100644
+--- a/Project1/kernel/defs.h
++++ b/Project1/kernel/defs.h
+@@ -106,6 +106,8 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++int             info(int);
++
+ 
+
+diff --git a/Project1/kernel/proc.c b/Project1/kernel/proc.c
+index 130d9ce..01c7b96 100644
+--- a/Project1/kernel/proc.c
++++ b/Project1/kernel/proc.c
+@@ -6,6 +6,7 @@
++
++//lab1- system call info() implementation
++int
++info(int param)
++{
++  struct proc *p; //pointer to instance of struct proc
++  int proc_count=0;
++  
++  //switch cases to process the various user inputted parameters
++  switch(param){
++    case 1: { //count #processes in system
++      for(p=proc; p<&proc[NPROC]; p++){
++        acquire(&p->lock);  //lock needed; avoid race conditions iter. proc array
++          if(p->state != UNUSED) proc_count++; //count active proc only
++        release(&p->lock);  //relase lock
++      }
++      return proc_count;
++    }
++    case 2: {//return count of # of info() func calls by cur_proc
++      return myproc()->infoCalls;
++    }
++    case 3: {//#memory pages cur_proc stored in add. above 0xF000000
++      uint64 numPages=0;  //total memory pages
++      uint64 pagesAbove=0;//pages above 0xF000000
++      struct proc *curproc = myproc(); //get current process
++      pagetable_t pagetable = curproc->pagetable; 
++      uint64 threshold = 0xF000000; //address threshold
++      
++       printf("\n");
++      //iterate through current process page table w/ xv6 walk() for each level (L2->L0)
++      for (uint64 va = 0; va < MAXVA ; va += PGSIZE) { //range va 0 -> max VA xv6 allows
++        pte_t *pte = walk(pagetable, va, 0);
++        if (pte && (*pte & PTE_V)) {  //check page valid bit
++          numPages++;
++
++          //get page table indices from virtual address and perform bit shift & masking
++          int l2_index = (va >> 30) & 0x1FF;  //L2 bits range (30-38)
++          int l1_index = (va >> 21) & 0x1FF;  //L1 bits range (21-29)
++          int l0_index = (va >> 12) & 0x1FF;  //L0 bits range (12-20)
++          printf("Page found at indices: L2=%d, L1=%d, L0=%d (VA: 0x%lx)\n",
++                l2_index, l1_index, l0_index, va);
++
++          //check page va is above address threshold
++          if (va > threshold) pagesAbove++;
++        }
++      }
++      printf("Total Pages: %lu, Pages Above 0xF000000: %lu\n\n", numPages, pagesAbove);
++      return pagesAbove;
++    }
++    case 4: {//address of kernel stack
++      return myproc()->kstack;
++    }
++    default:
++      return -1; //invalid paramter
++  }
++}
+
+
+
+diff --git a/Project1/kernel/proc.h b/Project1/kernel/proc.h
+index d021857..d966751 100644
+--- a/Project1/kernel/proc.h
++++ b/Project1/kernel/proc.h
+@@ -104,4 +104,7 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++
++  //lab1 
++  int infoCalls;               //track number of times info() is called
+ };
+
+
+diff --git a/Project1/kernel/syscall.c b/Project1/kernel/syscall.c
+index ed65409..af30b8c 100644
+--- a/Project1/kernel/syscall.c
++++ b/Project1/kernel/syscall.c
+@@ -101,6 +101,7 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_info(void);  //lab1
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +127,7 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_close]   sys_close,
++[SYS_info]    sys_info,  //lab1
+ };
+ 
+
+
+diff --git a/Project1/kernel/syscall.h b/Project1/kernel/syscall.h
+index bc5f356..231712e 100644
+--- a/Project1/kernel/syscall.h
++++ b/Project1/kernel/syscall.h
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_info   30  //lab1
+
+
+diff --git a/Project1/kernel/sysproc.c b/Project1/kernel/sysproc.c
+index 3b4d5bd..17ae648 100644
+--- a/Project1/kernel/sysproc.c
++++ b/Project1/kernel/sysproc.c
++
++//lab1- system call for proccess info
++uint64 
++sys_info(void)  
++{
++  int param; //user inputted parameter to pass to kernel
++
++  //extract user parameter and pass to sys_call func. info in proc.c
++  argint(0,&param);
++  myproc()->infoCalls++; //increment var in struct proc to tack count
++
++  return info(param);
++}
+
+diff --git a/Project1/user/test_info.c b/Project1/user/test_info.c
+new file mode 100644
+index 0000000..7890f28
+--- /dev/null
++++ b/Project1/user/test_info.c
+@@ -0,0 +1,13 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++int main() {
++    printf("\nTotal number of info system calls made by current process: %d\n", info(2));
++    printf("Total number of processes: %d\n", info(1));
++    printf("Total number of info system calls made by current process: %d\n", info(2));
++    printf("Total number of memory pages used by current process: %d\n", info(3));
++    printf("Total number of info system calls made by current process: %d\n", info(2));
++    printf("Address of the kernel stack: 0x%x\n\n", info(4));
++    exit(0);
++}
+
+
+diff --git a/Project1/user/user.h b/Project1/user/user.h
+index f16fe27..aba4a6d 100644
+--- a/Project1/user/user.h
++++ b/Project1/user/user.h
+@@ -22,6 +22,7 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int info(int);  //lab 1 sys_call function info()
+ 
+
+diff --git a/Project1/user/usys.pl b/Project1/user/usys.pl
+index 01e426e..30eef2a 100755
+--- a/Project1/user/usys.pl
++++ b/Project1/user/usys.pl
+@@ -36,3 +36,4 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("info");  #lab1 sys_call func info()
+
+
