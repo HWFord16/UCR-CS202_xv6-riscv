@@ -10,6 +10,7 @@ struct spinlock tickslock;
 uint ticks;
 
 extern char trampoline[], uservec[], userret[];
+extern pte_t *walk(pagetable_t pagetable, uint64 va, int alloc); //proj2 COW 
 
 // in kernelvec.S, calls kerneltrap().
 void kernelvec();
@@ -33,6 +34,57 @@ trapinithart(void)
 // handle an interrupt, exception, or system call from user space.
 // called from trampoline.S
 //
+// void
+// usertrap(void)
+// {
+//   int which_dev = 0;
+
+//   if((r_sstatus() & SSTATUS_SPP) != 0)
+//     panic("usertrap: not from user mode");
+
+//   // send interrupts and exceptions to kerneltrap(),
+//   // since we're now in the kernel.
+//   w_stvec((uint64)kernelvec);
+
+//   struct proc *p = myproc();
+  
+//   // save user program counter.
+//   p->tf->epc = r_sepc();
+  
+//   if(r_scause() == 8){
+//     // system call
+
+//     if(p->killed)
+//       exit(-1);
+
+//     // sepc points to the ecall instruction,
+//     // but we want to return to the next instruction.
+//     p->tf->epc += 4;
+
+//     // an interrupt will change sstatus &c registers,
+//     // so don't enable until done with those registers.
+//     intr_on();
+
+//     syscall();
+//   } else if((which_dev = devintr()) != 0){
+//     // ok
+//   } else {
+//     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+//     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+//     p->killed = 1;
+//   }
+
+//   if(p->killed)
+//     exit(-1);
+
+//   // give up the CPU if this is a timer interrupt.
+//   if(which_dev == 2)
+//     yield();
+
+//   usertrapret();
+// }
+
+//Proj2- modified trap handling for page faults due to COW mechanism
 void
 usertrap(void)
 {
@@ -65,7 +117,53 @@ usertrap(void)
     intr_on();
 
     syscall();
-  } else if((which_dev = devintr()) != 0){
+
+  //Proj2_ COW fault handler
+  }else if(r_scause() == 15){  //page fault exception handler 15=page
+    uint64 va = r_stval();  //fetch virtual address of the fault
+    uint64 flags;
+    uint64 oldPA;
+    pte_t *pte;
+    char *newPage;
+    pagetable_t pgTbl = p->pagetable;
+
+    //checks before allocating for new page
+    if(va >= MAXVA){ //check validity of va
+      p->killed = 1;
+      exit(-1);
+    }
+    if((pte=walk(pgTbl,va,0)) == 0){ //walk page table for va faulting
+      p->killed = 1;
+      exit(-1);
+    }
+    if((*pte & PTE_V) == 0 || (*pte & PTE_U) == 0){ //check for valid bit
+      p->killed = 1;
+      exit(-1);
+    }
+
+    if (!(*pte & PTE_RSW)) {
+      printf("usertrap: page fault on non-COW page at %p\n", va);
+      p->killed = 1;  //kill the process not a COW fault
+      exit(-1);
+    }
+
+    //allocate new physical page
+    oldPA = PTE2PA(*pte); //get old page physical address
+    if((newPage= kalloc())==0){
+      p->killed = 1;
+      exit(-1);
+    }
+    
+    //copy old page to new page and update PTEs
+    memmove(newPage, (char *)oldPA, PGSIZE);
+    flags = PTE_FLAGS(*pte); //fetch current flags
+    *pte = PA2PTE((uint64)newPage); //set new physical page
+    *pte |= flags; // restore flags
+    *pte |= PTE_W; //set write bit
+    
+    kfree((void*)oldPA); //free old physical page
+
+  }else if((which_dev = devintr()) != 0){
     // ok
   } else {
     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
