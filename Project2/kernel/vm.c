@@ -6,6 +6,9 @@
 #include "defs.h"
 #include "fs.h"
 
+extern struct spinlock pa_ref_lock;
+extern int pa_ref_count[1<<20];
+
 /*
  * the kernel's page table.
  */
@@ -75,7 +78,8 @@ kvminithart()
 //   21..39 -- 9 bits of level-1 index.
 //   12..20 -- 9 bits of level-0 index.
 //    0..12 -- 12 bits of byte offset within the page.
-static pte_t *
+
+pte_t *
 walk(pagetable_t pagetable, uint64 va, int alloc)
 {
   if(va >= MAXVA)
@@ -316,35 +320,49 @@ uvmfree(pagetable_t pagetable, uint64 sz)
 // physical memory.
 // returns 0 on success, -1 on failure.
 // frees any allocated pages on failure.
+
+//Project2 Implementation of uvmcopy() to support COW 
 int
 uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
 {
   pte_t *pte;
   uint64 pa, i;
   uint flags;
-  char *mem;
 
-  for(i = 0; i < sz; i += PGSIZE){
-    if((pte = walk(old, i, 0)) == 0)
+  for(i=0; i<sz; i += PGSIZE){
+    //check parent's page table for PTEs and their valid bit
+    if((pte=walk(old,i,0)) == 0)
       panic("uvmcopy: pte should exist");
     if((*pte & PTE_V) == 0)
       panic("uvmcopy: page not present");
-    pa = PTE2PA(*pte);
-    flags = PTE_FLAGS(*pte);
-    if((mem = kalloc()) == 0)
-      goto err;
-    memmove(mem, (char*)pa, PGSIZE);
-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
-      kfree(mem);
-      goto err;
+    
+    pa=PTE2PA(*pte); //get phyical address of PTE in parent
+    flags= PTE_FLAGS(*pte); //extract flags/bits for the PTE in parent 
+
+    //disable write and enable COW if the page was originally writable
+    if (flags & PTE_W) {
+      *pte &= ~PTE_W;   //disable parent write
+      *pte |= PTE_RSW;  //mark as COW page for parent
+      flags &= ~PTE_W;  //update flags for child write bit
+      flags |= PTE_RSW; //update flag as a COW page 
     }
+
+    //map pa to the child's page table rather than kalloc() and copying parent
+    if (mappages(new, i, PGSIZE, pa, flags) != 0)
+      goto err;
+
+    //update ref count for physical page, track #proc sharing same physical page
+    acquire(&pa_ref_lock);
+    pa_ref_count[pa/PGSIZE]++;;
+    release(&pa_ref_lock);
   }
   return 0;
 
- err:
-  uvmunmap(new, 0, i, 1);
+  err:
+  uvmunmap(new, 0, i / PGSIZE, 1);
   return -1;
 }
+
 
 // mark a PTE invalid for user access.
 // used by exec for the user stack guard page.
@@ -365,24 +383,53 @@ uvmclear(pagetable_t pagetable, uint64 va)
 int
 copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
 {
-  uint64 n, va0, pa0;
+  pte_t *pte;
+  char *new_pa;
+  uint64 flags;
+  uint64 n, va, pa;
 
+  //process each page individually until pages are copied
   while(len > 0){
-    va0 = PGROUNDDOWN(dstva);
-    pa0 = walkaddr(pagetable, va0);
-    if(pa0 == 0)
-      return -1;
-    n = PGSIZE - (dstva - va0);
-    if(n > len)
-      n = len;
-    memmove((void *)(pa0 + (dstva - va0)), src, n);
+    va = PGROUNDDOWN(dstva); //align va to page boundires
 
-    len -= n;
+    if(va >= MAXVA || dstva >= MAXVA) //check va are valid in user space
+      return -1;
+    if((pte = walk(pagetable, va, 0)) == 0) //find PTE in page tabel
+      return -1;
+    if((*pte & PTE_V) == 0 || (*pte & PTE_U) == 0) //check valid bit and user bit
+      return -1;
+
+    pa = PTE2PA(*pte); //get pa of the 
+
+    //handle COW page if page is read-only
+    if(((*pte) & PTE_W) == 0){
+      if((new_pa = kalloc()) == 0) //allocate new physical page
+        return -1;
+      memmove(new_pa, (char*)pa, PGSIZE); //copy from old to new page
+      flags = PTE_FLAGS(*pte); 
+      *pte = PA2PTE(new_pa);
+      *pte |= flags;
+      *pte |= PTE_W;
+
+      kfree((void*)pa); //free old page
+    }else{
+      new_pa=(char*)pa; //new page already writable
+    }
+
+    //determine size of data to copy
+    n = PGSIZE - (dstva - va); //amount of data which fits on page
+    if(n > len)
+      n = len; //copy remaining length if it fits in currnet page
+    
+    //copy data from kernel source buffer to destination page
+    memmove((void *)(new_pa + (dstva - va)), src, n);
+    len -= n; //go to next page and repeat process
     src += n;
-    dstva = va0 + PGSIZE;
+    dstva = va + PGSIZE;
   }
   return 0;
 }
+
 
 // Copy from user to kernel.
 // Copy len bytes to dst from virtual address srcva in a given page table.

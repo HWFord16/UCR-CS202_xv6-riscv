@@ -56,8 +56,7 @@ LD = $(TOOLPREFIX)ld
 OBJCOPY = $(TOOLPREFIX)objcopy
 OBJDUMP = $(TOOLPREFIX)objdump
 
-#CFLAGS = -Wall -Werror -O -fno-omit-frame-pointer -ggdb
-CFLAGS = -Wall -O -fno-omit-frame-pointer -ggdb -Wno-error=infinite-recursion
+CFLAGS = -Wall -Werror -O -fno-omit-frame-pointer -ggdb
 CFLAGS += -MD
 CFLAGS += -mcmodel=medany
 CFLAGS += -ffreestanding -fno-common -nostdlib -mno-relax
@@ -201,7 +200,7 @@ grade:
 	@echo $(MAKE) clean
 	@$(MAKE) clean || \
 	  (echo "'make clean' failed.  HINT: Do you have another running instance of xv6?" && exit 1)
-	./grade-lab-$(LAB) $(GRADEFLAGS)
+	python3 ./grade-lab-$(LAB) $(GRADEFLAGS)
 
 WEBSUB := https://6828.scripts.mit.edu/2019/handin.py
 
