@@ -1,0 +1,367 @@
+diff --git a/Project2/Makefile b/Project2/Makefile
+index 945f3d0..8764765 100644
+--- a/Project2/Makefile
++++ b/Project2/Makefile
+@@ -200,7 +200,7 @@ grade:
+ 	@echo $(MAKE) clean
+ 	@$(MAKE) clean || \
+ 	  (echo "'make clean' failed.  HINT: Do you have another running instance of xv6?" && exit 1)
+-	./grade-lab-$(LAB) $(GRADEFLAGS)
++	python3 ./grade-lab-$(LAB) $(GRADEFLAGS)
+ 
+ WEBSUB := https://6828.scripts.mit.edu/2019/handin.py
+ 
+diff --git a/Project2/batch-grade b/Project2/batch-grade
+old mode 100644
+new mode 100755
+diff --git a/Project2/grade-lab-alloc b/Project2/grade-lab-alloc
+old mode 100644
+new mode 100755
+diff --git a/Project2/grade-lab-cow b/Project2/grade-lab-cow
+old mode 100644
+new mode 100755
+diff --git a/Project2/grade-lab-sh b/Project2/grade-lab-sh
+old mode 100644
+new mode 100755
+diff --git a/Project2/grade-lab-util b/Project2/grade-lab-util
+old mode 100644
+new mode 100755
+
+
+diff --git a/Project2/kernel/kalloc.c b/Project2/kernel/kalloc.c
+index fa6a0ac..f23ae31 100644
+--- a/Project2/kernel/kalloc.c
++++ b/Project2/kernel/kalloc.c
+@@ -9,6 +9,9 @@
+ #include "riscv.h"
+ #include "defs.h"
+ 
++struct spinlock pa_ref_lock; //proj2- reference counter spinlock
++int pa_ref_count[PHYSTOP/PGSIZE]; //counter of each page
++
+ void freerange(void *pa_start, void *pa_end);
+ 
+ extern char end[]; // first address after kernel.
+@@ -26,6 +29,7 @@ struct {
+ void
+ kinit()
+ {
++  initlock(&pa_ref_lock, "pa_ref_lock"); //proj2- init ref counter lock
+   initlock(&kmem.lock, "kmem");
+   freerange(end, (void*)PHYSTOP);
+ }
+@@ -35,8 +39,14 @@ freerange(void *pa_start, void *pa_end)
+ {
+   char *p;
+   p = (char*)PGROUNDUP((uint64)pa_start);
+-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
++  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE){
++    //initially set counter to 1
++    acquire(&pa_ref_lock);
++    pa_ref_count[((uint64)p)/PGSIZE]=1; 
++    release(&pa_ref_lock);
++
+     kfree(p);
++  }
+ }
+ 
+ // Free the page of physical memory pointed at by v,
+@@ -46,20 +56,28 @@ freerange(void *pa_start, void *pa_end)
+ void
+ kfree(void *pa)
+ {
+-  struct run *r;
++  //decrease ref. counter
++  acquire(&pa_ref_lock);
++  pa_ref_count[((uint64)pa)/PGSIZE]--;
++  release(&pa_ref_lock);
+ 
+-  if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
+-    panic("kfree");
++  if(pa_ref_count[(uint64)pa/PGSIZE] ==0){
+ 
+-  // Fill with junk to catch dangling refs.
+-  memset(pa, 1, PGSIZE);
++    struct run *r;
+ 
+-  r = (struct run*)pa;
++    if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
++      panic("kfree");
+ 
+-  acquire(&kmem.lock);
+-  r->next = kmem.freelist;
+-  kmem.freelist = r;
+-  release(&kmem.lock);
++    // Fill with junk to catch dangling refs.
++    memset(pa, 1, PGSIZE);
++
++    r = (struct run*)pa;
++
++    acquire(&kmem.lock);
++    r->next = kmem.freelist;
++    kmem.freelist = r;
++    release(&kmem.lock);
++  }
+ }
+ 
+ // Allocate one 4096-byte page of physical memory.
+@@ -76,7 +94,14 @@ kalloc(void)
+     kmem.freelist = r->next;
+   release(&kmem.lock);
+ 
+-  if(r)
++  if(r){
+     memset((char*)r, 5, PGSIZE); // fill with junk
++
++    //init counter to 1
++    acquire(&pa_ref_lock);
++    pa_ref_count[((uint64)r)/PGSIZE]=1; 
++    release(&pa_ref_lock);
++  }
++  
+   return (void*)r;
+ }
+
+
+diff --git a/Project2/kernel/riscv.h b/Project2/kernel/riscv.h
+index f46ba59..a644778 100644
+--- a/Project2/kernel/riscv.h
++++ b/Project2/kernel/riscv.h
+@@ -332,6 +332,7 @@ sfence_vma()
+ #define PTE_W (1L << 2)
+ #define PTE_X (1L << 3)
+ #define PTE_U (1L << 4) // 1 -> user can access
++#define PTE_RSW (1L << 5) //proj2- Reserved for SoftWare Bit
+ // shift a physical address to the right place for a PTE.
+ #define PA2PTE(pa) ((((uint64)pa) >> 12) << 10)
+
+
+diff --git a/Project2/kernel/trap.c b/Project2/kernel/trap.c
+index 51a7805..f7deba6 100644
+--- a/Project2/kernel/trap.c
++++ b/Project2/kernel/trap.c
+@@ -10,6 +10,7 @@ struct spinlock tickslock;
+ uint ticks;
+ 
+ extern char trampoline[], uservec[], userret[];
++extern pte_t *walk(pagetable_t pagetable, uint64 va, int alloc); //proj2 COW 
+ 
+ // in kernelvec.S, calls kerneltrap().
+ void kernelvec();
+@@ -33,6 +34,8 @@ trapinithart(void)
+ // handle an interrupt, exception, or system call from user space.
+ // called from trampoline.S
+ //
++
++//Proj2- modified trap handling for page faults due to COW mechanism
+ void
+ usertrap(void)
+ {
+@@ -65,7 +68,53 @@ usertrap(void)
+     intr_on();
+ 
+     syscall();
+-  } else if((which_dev = devintr()) != 0){
++
++  //Proj2_ COW fault handler
++  }else if(r_scause() == 15){  //page fault exception handler 15=page
++    uint64 va = r_stval();  //fetch virtual address of the fault
++    uint64 flags;
++    uint64 oldPA;
++    pte_t *pte;
++    char *newPage;
++    pagetable_t pgTbl = p->pagetable;
++
++    //checks before allocating for new page
++    if(va >= MAXVA){ //check validity of va
++      p->killed = 1;
++      exit(-1);
++    }
++    if((pte=walk(pgTbl,va,0)) == 0){ //walk page table for va faulting
++      p->killed = 1;
++      exit(-1);
++    }
++    if((*pte & PTE_V) == 0 || (*pte & PTE_U) == 0){ //check for valid bit
++      p->killed = 1;
++      exit(-1);
++    }
++
++    if (!(*pte & PTE_RSW)) {
++      printf("usertrap: page fault on non-COW page at %p\n", va);
++      p->killed = 1;  //kill the process not a COW fault
++      exit(-1);
++    }
++
++    //allocate new physical page
++    oldPA = PTE2PA(*pte); //get old page physical address
++    if((newPage= kalloc())==0){
++      p->killed = 1;
++      exit(-1);
++    }
++    
++    //copy old page to new page and update PTEs
++    memmove(newPage, (char *)oldPA, PGSIZE);
++    flags = PTE_FLAGS(*pte); //fetch current flags
++    *pte = PA2PTE((uint64)newPage); //set new physical page
++    *pte |= flags; // restore flags
++    *pte |= PTE_W; //set write bit
++    
++    kfree((void*)oldPA); //free old physical page
++
++  }else if((which_dev = devintr()) != 0){
+     // ok
+   } else {
+     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+
+
+diff --git a/Project2/kernel/vm.c b/Project2/kernel/vm.c
+index dd65184..82ab515 100644
+--- a/Project2/kernel/vm.c
++++ b/Project2/kernel/vm.c
+@@ -6,6 +6,9 @@
+ #include "defs.h"
+ #include "fs.h"
+ 
++extern struct spinlock pa_ref_lock;
++extern int pa_ref_count[1<<20];
++//Project2 Implementation of uvmcopy() to support COW 
+ int
+ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+ {
+   pte_t *pte;
+   uint64 pa, i;
+   uint flags;
+-  char *mem;
+ 
+-  for(i = 0; i < sz; i += PGSIZE){
+-    if((pte = walk(old, i, 0)) == 0)
++  for(i=0; i<sz; i += PGSIZE){
++    //check parent's page table for PTEs and their valid bit
++    if((pte=walk(old,i,0)) == 0)
+       panic("uvmcopy: pte should exist");
+     if((*pte & PTE_V) == 0)
+       panic("uvmcopy: page not present");
+-    pa = PTE2PA(*pte);
+-    flags = PTE_FLAGS(*pte);
+-    if((mem = kalloc()) == 0)
+-      goto err;
+-    memmove(mem, (char*)pa, PGSIZE);
+-    if(mappages(new, i, PGSIZE, (uint64)mem, flags) != 0){
+-      kfree(mem);
+-      goto err;
++    
++    pa=PTE2PA(*pte); //get phyical address of PTE in parent
++    flags= PTE_FLAGS(*pte); //extract flags/bits for the PTE in parent 
++
++    //disable write and enable COW if the page was originally writable
++    if (flags & PTE_W) {
++      *pte &= ~PTE_W;   //disable parent write
++      *pte |= PTE_RSW;  //mark as COW page for parent
++      flags &= ~PTE_W;  //update flags for child write bit
++      flags |= PTE_RSW; //update flag as a COW page 
+     }
++
++    //map pa to the child's page table rather than kalloc() and copying parent
++    if (mappages(new, i, PGSIZE, pa, flags) != 0)
++      goto err;
++
++    //update ref count for physical page, track #proc sharing same physical page
++    acquire(&pa_ref_lock);
++    pa_ref_count[pa/PGSIZE]++;;
++    release(&pa_ref_lock);
+   }
+   return 0;
+ 
+- err:
+-  uvmunmap(new, 0, i, 1);
++  err:
++  uvmunmap(new, 0, i / PGSIZE, 1);
+   return -1;
+ }
+ 
++
+ // mark a PTE invalid for user access.
+ // used by exec for the user stack guard page.
+ void
+@@ -365,25 +383,54 @@ uvmclear(pagetable_t pagetable, uint64 va)
+ int
+ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+ {
+-  uint64 n, va0, pa0;
++  pte_t *pte;
++  char *new_pa;
++  uint64 flags;
++  uint64 n, va, pa;
+ 
++  //process each page individually until pages are copied
+   while(len > 0){
+-    va0 = PGROUNDDOWN(dstva);
+-    pa0 = walkaddr(pagetable, va0);
+-    if(pa0 == 0)
++    va = PGROUNDDOWN(dstva); //align va to page boundires
++
++    if(va >= MAXVA || dstva >= MAXVA) //check va are valid in user space
++      return -1;
++    if((pte = walk(pagetable, va, 0)) == 0) //find PTE in page tabel
++      return -1;
++    if((*pte & PTE_V) == 0 || (*pte & PTE_U) == 0) //check valid bit and user bit
+       return -1;
+-    n = PGSIZE - (dstva - va0);
+-    if(n > len)
+-      n = len;
+-    memmove((void *)(pa0 + (dstva - va0)), src, n);
+ 
+-    len -= n;
++    pa = PTE2PA(*pte); //get pa of the 
++
++    //handle COW page if page is read-only
++    if(((*pte) & PTE_W) == 0){
++      if((new_pa = kalloc()) == 0) //allocate new physical page
++        return -1;
++      memmove(new_pa, (char*)pa, PGSIZE); //copy from old to new page
++      flags = PTE_FLAGS(*pte); 
++      *pte = PA2PTE(new_pa);
++      *pte |= flags;
++      *pte |= PTE_W;
++
++      kfree((void*)pa); //free old page
++    }else{
++      new_pa=(char*)pa; //new page already writable
++    }
++
++    //determine size of data to copy
++    n = PGSIZE - (dstva - va); //amount of data which fits on page
++    if(n > len)
++      n = len; //copy remaining length if it fits in currnet page
++    
++    //copy data from kernel source buffer to destination page
++    memmove((void *)(new_pa + (dstva - va)), src, n);
++    len -= n; //go to next page and repeat process
+     src += n;
+-    dstva = va0 + PGSIZE;
++    dstva = va + PGSIZE;
+   }
+   return 0;
+ }
+ 
+diff --git a/Project2/time.txt b/Project2/time.txt
+new file mode 100644
+index 0000000..9cd72aa
+--- /dev/null
++++ b/Project2/time.txt
+@@ -0,0 +1 @@
++72
+\ No newline at end of file
+
+
+diff --git a/Project2/user/sh.c b/Project2/user/sh.c
+index a593bc0..ba175f7 100644
+--- a/Project2/user/sh.c
++++ b/Project2/user/sh.c
+@@ -54,6 +54,7 @@ void panic(char*);
+ struct cmd *parsecmd(char*);
+ 
+ // Execute cmd.  Never returns.
++__attribute__((noreturn))
+ void
+ runcmd(struct cmd *cmd)
