@@ -379,29 +379,64 @@ static uint
 bmap(struct inode *ip, uint bn)
 {
   uint addr, *a;
-  struct buf *bp;
+  struct buf *bp, *bp2;
 
+  //case 1: data is in direct block 
   if(bn < NDIRECT){
     if((addr = ip->addrs[bn]) == 0)
-      ip->addrs[bn] = addr = balloc(ip->dev);
-    return addr;
-  }
-  bn -= NDIRECT;
+      ip->addrs[bn] = addr = balloc(ip->dev); //allocate new direct block (if needed)
+    return addr; //return disk block number
+  } 
 
+  //case 2: singly- indirect block: bn is in range of single indirect blocks
+  bn -= NDIRECT; 
   if(bn < NINDIRECT){
     // Load indirect block, allocating if necessary.
     if((addr = ip->addrs[NDIRECT]) == 0)
-      ip->addrs[NDIRECT] = addr = balloc(ip->dev);
-    bp = bread(ip->dev, addr);
-    a = (uint*)bp->data;
-    if((addr = a[bn]) == 0){
-      a[bn] = addr = balloc(ip->dev);
-      log_write(bp);
+      ip->addrs[NDIRECT] = addr = balloc(ip->dev); //allocate indirect block (if needed)
+
+    bp = bread(ip->dev, addr); //read indirect block
+    a = (uint*)bp->data; //cast buffer data as array of block numbers
+
+    if((addr = a[bn]) == 0){ //block is free 
+      a[bn] = addr = balloc(ip->dev); //allocate data block (if needed)
+      log_write(bp); //mark newly allocated block in singly-indirect block to write to disk
     }
-    brelse(bp);
-    return addr;
+    brelse(bp); //release buffer
+    return addr; //return physical disk block number
   }
 
+  //case 3: doubly-indirect block: bn is in range of double indirect blocks
+  bn -= NINDIRECT;
+  if(bn < NINDIRECT_DOUBLE){
+    if((addr = ip->addrs[NDIRECT+1]) == 0){ //allocate doubly indirect block (if needed)
+      ip->addrs[NDIRECT + 1] = addr = balloc(ip->dev);
+    }
+    bp = bread(ip->dev, addr);
+    a = (uint*)bp->data;
+
+    //find single indirect block within double indirect block
+    uint indrIdx = bn / NINDIRECT; //select single indirect block index
+    uint indrAdr = a[indrIdx];  //fetch address of single indirect block
+
+    if(indrAdr == 0){ //single indirect block free
+      a[indrIdx] = indrAdr = balloc(ip->dev); //allocate single indirect block
+      log_write(bp); //mark newly allocated block in doubly-indirect block 
+    }
+    brelse(bp);
+
+    //read single indirect block and allocate data block
+    bp2 = bread(ip->dev, indrAdr);
+    a = (uint*)bp2->data;
+    uint dataIdx = bn % NINDIRECT; //fetch index of data block in singly-indrect block
+
+    if((addr = a[dataIdx]) == 0){ //data block free
+      a[dataIdx] = addr = balloc(ip->dev); //allocate data block (if needed)
+      log_write(bp2);
+    }
+    brelse(bp2);
+    return addr;
+  }
   panic("bmap: out of range");
 }
 
