@@ -256,6 +256,7 @@ create(char *path, short type, short major, short minor)
       return ip;
     iunlockput(ip);
     return 0;
+    if(type == T_SYMLINK) return ip;
   }
 
   if((ip = ialloc(dp->dev, type)) == 0)
@@ -283,13 +284,39 @@ create(char *path, short type, short major, short minor)
   return ip;
 }
 
+//File Systems lab implementation
 uint64
 sys_symlink(void)
 {
-  //your implementation goes here
+  char target[MAXPATH], path[MAXPATH]; //buffers for storing target/symlink paths
+  struct inode *ip; //inode for new symlink
+
+  //fetch paramenters from system call in user space read into buffers
+  if(argstr(0,target,MAXPATH) < 0 || argstr(1,path,MAXPATH)< 0){
+    return -1; //argument retrieval failure
+  }
+
+  begin_op(ROOTDEV); //start fs operations w/dev num of fs root disk
+
+  //create inode for symlink
+  if((ip = create(path, T_SYMLINK, 0,0)) == 0){
+    end_op(ROOTDEV); //end fs operations
+    return -1;
+  }
+
+  //write target path to inode's data blocks
+  int len = strlen(target);
+  writei(ip, 0, (uint64)&len, 0, sizeof(int));
+  writei(ip, 0, (uint64)target, sizeof(int), len+1);
+  iupdate(ip);
+  iunlockput(ip);
+
+  end_op(ROOTDEV); //end fd operations
   return 0;
 }
 
+
+//modify for File System Lab 
 uint64
 sys_open(void)
 {
@@ -299,36 +326,68 @@ sys_open(void)
   struct inode *ip;
   int n;
 
+  //take user arguments of system call
   if((n = argstr(0, path, MAXPATH)) < 0 || argint(1, &omode) < 0)
-    return -1;
+    return -1; //error
 
-  begin_op(ROOTDEV);
+  begin_op(ROOTDEV); //begin fs operations
 
+  //flag O_CREATE is set, create new file
   if(omode & O_CREATE){
     ip = create(path, T_FILE, 0, 0);
     if(ip == 0){
       end_op(ROOTDEV);
-      return -1;
+      return -1; //error
     }
-  } else {
+  } else { //follow symlinks until O_NOFOllOW flag is set
     if((ip = namei(path)) == 0){
       end_op(ROOTDEV);
       return -1;
     }
     ilock(ip);
-    if(ip->type == T_DIR && omode != O_RDONLY){
+
+    //handle symlinks if O_NOFOLLOW not set
+    if((ip->type == T_SYMLINK) && !(omode & O_NOFOLLOW)){
+      int depth=0; //tracking recursion levels of symlinks
+  
+      while(ip->type == T_SYMLINK && depth <10){ //follow symlinks until depth 10
+        int len=0;
+
+        //read symlink target length from inode data blocks
+        readi(ip, 0, (uint64)&len, 0, sizeof(int));
+        if(len > MAXPATH) panic("sys_open(): failed symlink inode\n");
+        readi(ip, 0, (uint64)path, sizeof(int), len+1);
+
+        iunlockput(ip); //release old inode before resolving new path
+        if((ip = namei(path)) == 0){ // resolve symlink target 
+          end_op(ROOTDEV);
+          return -1; //symlink target does not exist
+        }
+        ilock(ip); //lock new inode to avoid race conditions
+        depth++;   //increment recursive level counter
+      }
+      if(depth >= 10){ //check depth limit to prevent infinite loops
+        printf("\nsys_open(): Symlink Cycle Detected\n");
+        iunlockput(ip);
+        end_op(ROOTDEV);
+        return -1;
+      }
+    }
+
+    if(ip->type == T_DIR && omode != O_RDONLY){ //prevent writing to directories
       iunlockput(ip);
       end_op(ROOTDEV);
-      return -1;
+      return -1; //error
     }
   }
-
+  
+  //ensure valid device file
   if(ip->type == T_DEVICE && (ip->major < 0 || ip->major >= NDEV)){
     iunlockput(ip);
     end_op(ROOTDEV);
     return -1;
   }
-
+  //allocate file descriptor
   if((f = filealloc()) == 0 || (fd = fdalloc(f)) < 0){
     if(f)
       fileclose(f);
@@ -336,7 +395,7 @@ sys_open(void)
     end_op(ROOTDEV);
     return -1;
   }
-
+  //handle device files
   if(ip->type == T_DEVICE){
     f->type = FD_DEVICE;
     f->major = ip->major;
