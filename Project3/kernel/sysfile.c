@@ -367,7 +367,6 @@ sys_open(void)
         depth++;   //increment recursive level counter
       }
       if(depth >= 10){ //check depth limit to prevent infinite loops
-        printf("\nsys_open(): Symlink Cycle Detected\n");
         iunlockput(ip);
         end_op(ROOTDEV);
         return -1;
